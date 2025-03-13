@@ -38,6 +38,9 @@ def mcmc_conditional_dpp_sample(
     Returns:
       A single subset (list of indices) that includes i.
       (We pick whichever subset has the highest det(L_S) encountered in MCMC.)
+
+    This is a demonstration. In production, you might refine or optimize
+    acceptance thresholds, do parallel chains, etc.
     """
     device = L.device
     T = L.shape[0]
@@ -57,7 +60,7 @@ def mcmc_conditional_dpp_sample(
             if len(S) == 0:
                 return 0.0
             idx = torch.tensor(list(S), device=device)
-            Ls = L[idx][:, idx]
+            Ls = L[idx][:, idx].float()  # cast to float
             val = torch.linalg.det(Ls)
             return max(val.item(), 0.0)
 
@@ -77,7 +80,7 @@ def mcmc_conditional_dpp_sample(
                 # propose adding it
                 new_subset.add(cand)
             new_det = subset_det(new_subset)
-            # acceptance ratio = new_det / old_det (if old_det=0 => accept if new_det>0)
+            # acceptance ratio = new_det / old_det
             if cur_det <= 1e-12:
                 accept_prob = 1.0 if new_det > 0 else 0
             else:
@@ -110,22 +113,29 @@ def dpp_sample_spectral(L: torch.Tensor) -> List[int]:
     Exact spectral DPP sampling (without conditioning). O(T^3).
     Standard approach: eigen-decompose, pick eigenvectors, iterative item inclusion.
     """
-    w, V = torch.linalg.eigh(L)
+    # Force float for eigen-decomposition
+    L_fp32 = L.float()
+    w, V = torch.linalg.eigh(L_fp32)
+    # clip negative eigenvalues just in case of numerical issues
+    w = torch.clip(w, min=0.0)
+
     keep = []
     for lam in w:
-        lam = max(lam, 0.0)  # clip negative eigenvalues
         p = lam / (1.0 + lam)
         if torch.rand(1, device=L.device) < p:
             keep.append(True)
         else:
             keep.append(False)
+
     chosen_evecs = V[:, keep]
     if chosen_evecs.shape[1] == 0:
         return []
+
     subset = []
     items = list(range(L.shape[0]))
     perm = torch.randperm(len(items), device=L.device)
     items = [items[i.item()] for i in perm]
+
     for it in items:
         proj = torch.linalg.norm(chosen_evecs[it])**2
         if chosen_evecs.shape[1] > 0:
@@ -134,8 +144,8 @@ def dpp_sample_spectral(L: torch.Tensor) -> List[int]:
             accept_prob = 0.0
         if torch.rand(1, device=L.device) < accept_prob:
             subset.append(it)
-            # For correctness we'd re-orthonormalize chosen_evecs to remove
-            # the direction corresponding to it. We'll omit for brevity => approximate.
+            # For strict correctness we'd remove that direction. We skip it => approximate.
+
     return sorted(subset)
 
 ############################################################
@@ -181,7 +191,8 @@ def aggregator_for_token_i_unfixed(
         if len(S) == 0:
             return 0.0
         idx = torch.tensor(list(S), device=device)
-        Ls = L[idx][:, idx]
+        # cast to float32
+        Ls = L[idx][:, idx].float()
         dt = torch.linalg.det(Ls)
         return max(dt.item(), 0.0)
 
@@ -303,7 +314,7 @@ class CausalSelfAttentionDPP(nn.Module):
         out = torch.zeros_like(q)
 
         # 2D causal mask
-        causal_2d = self.bias[:, :, :T, :T][0,0]  # shape [T,T], 1=allowed
+        causal_2d = self.bias[:, :, :T, :T][0, 0]  # shape [T,T], 1=allowed
 
         # We'll chunk over T in the query dimension
         num_chunks = (T + self.chunk_size - 1) // self.chunk_size
@@ -597,6 +608,6 @@ class GPT(nn.Module):
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         flops_achieved = flops_per_iter * (1.0 / dt)
-        # A100 BF16 peak ~312 TFLOPS
+        # A100 BF16 ~312 TFLOPS
         flops_promised = 312e12
         return flops_achieved / flops_promised
