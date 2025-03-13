@@ -78,7 +78,7 @@ def mcmc_conditional_dpp_sample(
 
     return best_subset
 
-@torch._dynamo.skip
+@torch._dynamo.disable
 def spectral_conditional_dpp_sample(L: torch.Tensor, i: int, tries: int = 10) -> List[int]:
     """
     Fallback exact spectral sampling for smaller T.
