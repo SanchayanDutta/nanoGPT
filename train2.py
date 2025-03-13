@@ -76,7 +76,7 @@ backend = 'nccl'
 # system
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
-compile = True
+compile = False
 # -----------------------------------------------------------------------------
 
 config_keys = [k for k,v in globals().items()
