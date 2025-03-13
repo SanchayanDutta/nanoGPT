@@ -16,7 +16,7 @@ from typing import Optional, List
 # 1) MCMC-based approximate DPP sampling (for large T)
 ############################################################
 
-@torch._dynamo.skip
+@torch._dynamo.disable
 def mcmc_conditional_dpp_sample(
     L: torch.Tensor,
     i: int,
@@ -90,7 +90,7 @@ def spectral_conditional_dpp_sample(L: torch.Tensor, i: int, tries: int = 10) ->
             return S
     return [i]
 
-@torch._dynamo.skip
+@torch._dynamo.disable
 def dpp_sample_spectral(L: torch.Tensor) -> List[int]:
     """
     Exact spectral DPP sampling (no conditioning). O(T^3).
@@ -136,7 +136,7 @@ def dpp_sample_spectral(L: torch.Tensor) -> List[int]:
 # 2) Unfixed-size aggregator for token i
 ############################################################
 
-@torch._dynamo.skip
+@torch._dynamo.disable
 def aggregator_for_token_i_unfixed(
     i: int,
     L: torch.Tensor,
