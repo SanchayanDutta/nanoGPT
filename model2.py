@@ -8,7 +8,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch._dynamo  # for @torch._dynamo.skip
+import torch._dynamo
 from dataclasses import dataclass
 from typing import Optional, List
 
@@ -25,21 +25,8 @@ def mcmc_conditional_dpp_sample(
 ) -> List[int]:
     """
     Approximate conditional DPP sampling via Markov Chain Monte Carlo (MCMC).
-
-    We want a subset S that definitely includes token i, with probability ~ det(L_S).
-    We do a simple "birth-death" chain approach:
-      - Start from a small subset that includes i (maybe random size).
-      - Repeatedly try to add/remove one item at a time, accept with prob ratio of det() changes.
-
-    Args:
-      L: [T, T] PSD kernel
-      i: forced item in subset
-      mcmc_steps: number of MCMC updates
-      init_subsets: how many random restarts to try for better coverage
-
-    Returns:
-      A single subset (list of indices) that includes i.
-      (We pick whichever subset has the highest det(L_S) encountered in MCMC.)
+    We want a subset S that definitely includes i, with probability ~ det(L_S).
+    We'll do a "birth-death" chain approach, run multiple restarts, etc.
     """
     device = L.device
     T = L.shape[0]
@@ -53,7 +40,6 @@ def mcmc_conditional_dpp_sample(
         # cast to float32 for stable determinant
         Ls = L[idx][:, idx].float()
         val = torch.linalg.det(Ls)
-        # clamp at zero in case of tiny negative numerical fuzz
         return torch.clamp_min(val, 0.0)
 
     for _ in range(init_subsets):
@@ -63,9 +49,9 @@ def mcmc_conditional_dpp_sample(
             if t_ != i and random.random() < 0.3:
                 subset.add(t_)
 
-        cur_det = subset_det(subset).detach().cpu().item()
+        cur_det = float(subset_det(subset).detach().cpu())
 
-        # MCMC
+        # MCMC loop
         for _step in range(mcmc_steps):
             cand = random.randint(0, T-1)
             if cand == i:
@@ -76,7 +62,7 @@ def mcmc_conditional_dpp_sample(
             else:
                 new_subset.add(cand)
 
-            new_det = subset_det(new_subset).detach().cpu().item()
+            new_det = float(subset_det(new_subset).detach().cpu())
             if cur_det <= 1e-12:
                 accept_prob = 1.0 if new_det > 0.0 else 0.0
             else:
@@ -97,8 +83,6 @@ def spectral_conditional_dpp_sample(L: torch.Tensor, i: int, tries: int = 10) ->
     """
     Fallback exact spectral sampling for smaller T.
     Repeatedly sample from the DPP until we get a subset that includes i.
-    If none has i, fallback to [i].
-    Complexity: O(T^3) per sample, so only feasible for relatively small T.
     """
     for _ in range(tries):
         S = dpp_sample_spectral(L)
@@ -109,13 +93,13 @@ def spectral_conditional_dpp_sample(L: torch.Tensor, i: int, tries: int = 10) ->
 @torch._dynamo.skip
 def dpp_sample_spectral(L: torch.Tensor) -> List[int]:
     """
-    Exact spectral DPP sampling (without conditioning). O(T^3).
-    Standard approach: eigen-decompose, pick eigenvectors, iterative item inclusion.
+    Exact spectral DPP sampling (no conditioning). O(T^3).
+    Standard approach: eigen-decompose, pick eigenvectors, iterative inclusion.
     """
+    # cast to float32 to avoid bfloat16 issues
     L_fp32 = L.float()
     w, V = torch.linalg.eigh(L_fp32)
-    # clip negative eigenvalues in case of numerical issues
-    w = torch.clamp_min(w, 0.0)
+    w = torch.clamp_min(w, 0.0)  # remove tiny negative numerical fuzz
 
     keep_mask = []
     for lam in w:
@@ -143,7 +127,8 @@ def dpp_sample_spectral(L: torch.Tensor) -> List[int]:
 
         if torch.rand(1, device=L.device) < accept_prob:
             subset.append(it)
-            # Skipping re-orthonormalization for brevity => approximate.
+            # For correctness we'd remove that direction from chosen_evecs. 
+            # We skip it => approximate.
 
     return sorted(subset)
 
@@ -165,24 +150,7 @@ def aggregator_for_token_i_unfixed(
     For each token i, sample up to n_subs subsets from an unconstrained DPP
     that must contain i. Weighted aggregator:
         sum_{S}( det(L_S) * mean(v_j : j in S ) ) / sum_{S} det(L_S)
-    with S possibly any size >= 1.
-
-    We do either:
-      - exact spectral approach if T <= small_thresh
-      - MCMC approach otherwise
     We skip subsets that contain disallowed items from `window_mask`.
-
-    Args:
-      i: forced item index
-      L: [T, T] kernel
-      v: [T, d] values
-      n_subs: how many subsets to sample
-      small_thresh: if local T <= this => exact spectral => otherwise MCMC
-      mcmc_steps: steps for MCMC approach
-      window_mask: [T], 1=allowed, 0=excluded from subset
-
-    Returns:
-      aggregator of shape [d]
     """
     device = L.device
     T, d = v.shape
@@ -191,7 +159,6 @@ def aggregator_for_token_i_unfixed(
         if not S:
             return torch.tensor(0.0, device=device)
         idx = torch.tensor(list(S), device=device)
-        # cast to float32 for stable determinant
         Ls = L[idx][:, idx].float()
         val = torch.linalg.det(Ls)
         return torch.clamp_min(val, 0.0)
@@ -207,8 +174,6 @@ def aggregator_for_token_i_unfixed(
             S = [x for x in S if window_mask[x].item() == 1]
             if i not in S:
                 S = [i]
-
-        # gather distinct subsets
         if S not in subsets:
             subsets.append(S)
         if len(subsets) >= n_subs:
@@ -217,7 +182,6 @@ def aggregator_for_token_i_unfixed(
     if not subsets:
         subsets = [[i]]
 
-    # build a tensor for the weights
     weight_list = []
     sub_avgs = []
     for S_ in subsets:
@@ -227,16 +191,15 @@ def aggregator_for_token_i_unfixed(
             avg_v = v[idx].mean(dim=0)
         else:
             avg_v = torch.zeros(d, device=device)
-        weight_list.append(dt)      # 0D tensor
-        sub_avgs.append(avg_v)      # [d]
+        weight_list.append(dt)     # 0D tensor
+        sub_avgs.append(avg_v)     # [d]
 
-    # stack 0D weights along dim=0
-    w_t = torch.stack(weight_list, dim=0)  # shape [#subsets]
+    # stack weights
+    w_t = torch.stack(weight_list, dim=0)  # shape [#subs]
     denom = w_t.sum() + 1e-9
     out = torch.zeros(d, device=device)
     for i_sub, avg_v in enumerate(sub_avgs):
-        out += (w_t[i_sub] / denom) * avg_v
-
+        out += (w_t[i_sub]/denom) * avg_v
     return out
 
 ############################################################
@@ -279,16 +242,20 @@ class CausalSelfAttentionDPP(nn.Module):
         self.mcmc_steps = mcmc_steps
         self.chunk_size = chunk_size
 
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=bias)
+        self.c_attn = nn.Linear(n_embd, 3*n_embd, bias=bias)
         self.c_proj = nn.Linear(n_embd, n_embd, bias=bias)
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
         # causal mask
         tri = torch.tril(torch.ones(block_size, block_size))
-        self.register_buffer("bias", tri.view(1, 1, block_size, block_size))
+        self.register_buffer("bias", tri.view(1,1,block_size,block_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, T, C]
+        returns [B, T, C]
+        """
         B, T, C = x.shape
         assert T <= self.block_size
 
@@ -298,12 +265,9 @@ class CausalSelfAttentionDPP(nn.Module):
         v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)
 
         out = torch.zeros_like(q)
+        causal_2d = self.bias[:, :, :T, :T][0, 0]  # shape [T,T], 1=allowed
 
-        # 2D causal mask (1=allowed, 0=disallowed)
-        causal_2d = self.bias[:, :, :T, :T][0, 0]  # shape [T, T]
-
-        # chunk the query dimension to limit Python loop overhead
-        num_chunks = (T + self.chunk_size - 1) // self.chunk_size
+        num_chunks = (T + self.chunk_size - 1)//self.chunk_size
 
         for bidx in range(B):
             for hidx in range(self.n_head):
@@ -312,34 +276,31 @@ class CausalSelfAttentionDPP(nn.Module):
 
                 row_out = []
                 for cidx in range(num_chunks):
-                    start = cidx * self.chunk_size
-                    end = min(T, (cidx + 1) * self.chunk_size)
+                    start = cidx*self.chunk_size
+                    end = min(T, (cidx+1)*self.chunk_size)
                     chunk_outputs = []
                     for i_rel in range(end - start):
                         i_ = start + i_rel
 
-                        # define local range [i_-window+1 ... i_]
-                        if self.local_window > 0:
+                        if self.local_window>0:
                             left = max(0, i_ - self.local_window + 1)
                         else:
                             left = 0
-                        right = i_ + 1
+                        right = i_+1
                         cand_idx = list(range(left, right))
-                        # enforce causal mask => j <= i_
-                        cand_idx = [j for j in cand_idx if causal_2d[i_, j] == 1]
+                        # apply causal mask
+                        cand_idx = [j for j in cand_idx if causal_2d[i_, j]==1]
                         if not cand_idx:
                             # fallback
                             chunk_outputs.append(v_bh[i_].unsqueeze(0))
                             continue
 
-                        local_q = q_bh[cand_idx]  # [local_T, head_size]
-                        L_local = local_q @ local_q.transpose(0, 1)  # [local_T, local_T]
-                        L_local *= (1.0 / math.sqrt(self.head_size))
+                        local_q = q_bh[cand_idx]
+                        L_local = local_q @ local_q.transpose(0,1)
+                        L_local *= (1.0/math.sqrt(self.head_size))
 
-                        local_v = v_bh[cand_idx]  # [local_T, head_size]
-
+                        local_v = v_bh[cand_idx]
                         if i_ not in cand_idx:
-                            # if i_ is outside the local subset => fallback
                             chunk_outputs.append(v_bh[i_].unsqueeze(0))
                             continue
 
@@ -353,14 +314,12 @@ class CausalSelfAttentionDPP(nn.Module):
                             mcmc_steps=self.mcmc_steps,
                         )
                         chunk_outputs.append(up_i.unsqueeze(0))
-
-                    chunk_outputs = torch.cat(chunk_outputs, dim=0)  # [chunk_size, head_size]
+                    chunk_outputs = torch.cat(chunk_outputs, dim=0)
                     row_out.append(chunk_outputs)
-
-                row_out = torch.cat(row_out, dim=0)  # [T, head_size]
+                row_out = torch.cat(row_out, dim=0)
                 out[bidx, hidx] = row_out
 
-        y = out.transpose(1, 2).contiguous().view(B, T, C)
+        y = out.transpose(1,2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -448,42 +407,40 @@ class GPTConfig:
 
 class GPT(nn.Module):
     """
-    A GPT-like model that uses an unconstrained DPP synergy-based attention
-    with local windowing, chunking, MCMC or spectral sampling, etc.
+    A GPT-like model that uses synergy-based DPP attention with local windows,
+    chunking, MCMC or spectral sampling, etc.
     """
 
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
-        self.transformer = nn.ModuleDict(
-            dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
-                wpe=nn.Embedding(config.block_size, config.n_embd),
-                drop=nn.Dropout(config.dropout),
-                h=nn.ModuleList([
-                    Block(
-                        n_embd=config.n_embd,
-                        n_head=config.n_head,
-                        block_size=config.block_size,
-                        dropout=config.dropout,
-                        bias=config.bias,
-                        local_window=config.local_window,
-                        n_subs=config.n_subs,
-                        small_thresh=config.small_thresh,
-                        mcmc_steps=config.mcmc_steps,
-                        chunk_size=config.chunk_size
-                    ) for _ in range(config.n_layer)
-                ]),
-                ln_f=LayerNorm(config.n_embd, bias=config.bias),
-            )
-        )
+        self.transformer = nn.ModuleDict(dict(
+            wte=nn.Embedding(config.vocab_size, config.n_embd),
+            wpe=nn.Embedding(config.block_size, config.n_embd),
+            drop=nn.Dropout(config.dropout),
+            h=nn.ModuleList([
+                Block(
+                    n_embd=config.n_embd,
+                    n_head=config.n_head,
+                    block_size=config.block_size,
+                    dropout=config.dropout,
+                    bias=config.bias,
+                    local_window=config.local_window,
+                    n_subs=config.n_subs,
+                    small_thresh=config.small_thresh,
+                    mcmc_steps=config.mcmc_steps,
+                    chunk_size=config.chunk_size
+                ) for _ in range(config.n_layer)
+            ]),
+            ln_f=LayerNorm(config.n_embd, bias=config.bias),
+        ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # weight tying
         self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
 
-        # special scaled init for c_proj per GPT-2
+        # special scaled init
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2*config.n_layer))
@@ -521,7 +478,7 @@ class GPT(nn.Module):
                 ignore_index=-1
             )
         else:
-            # inference => only return logits for the last token
+            # inference => last token only
             logits = self.lm_head(x[:, -1:, :])
             loss = None
 
@@ -530,9 +487,7 @@ class GPT(nn.Module):
     def crop_block_size(self, new_size: int):
         assert new_size <= self.config.block_size
         self.config.block_size = new_size
-        self.transformer.wpe.weight = nn.Parameter(
-            self.transformer.wpe.weight[:new_size]
-        )
+        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:new_size])
         for block in self.transformer.h:
             if hasattr(block.attn, "bias"):
                 block.attn.bias = block.attn.bias[:, :, :new_size, :new_size]
@@ -591,18 +546,15 @@ class GPT(nn.Module):
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """
         PaLM-based MFU estimate, ignoring overhead from MCMC or chunking.
-        A reference only.
+        It's just for reference.
         """
         N = sum(p.numel() for p in self.parameters())
         L, H = self.config.n_layer, self.config.n_head
         Q = self.config.n_embd // self.config.n_head
         T = self.config.block_size
-
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        flops_achieved = flops_per_iter * (1.0 / dt)
-
-        # A100 BF16 => ~312 TFLOPS
-        flops_promised = 312e12
+        flops_achieved = flops_per_iter * (1.0/dt)
+        flops_promised = 312e12  # A100 BF16 ~312 TFLOPS
         return flops_achieved / flops_promised
