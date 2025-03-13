@@ -38,9 +38,6 @@ def mcmc_conditional_dpp_sample(
     Returns:
       A single subset (list of indices) that includes i.
       (We pick whichever subset has the highest det(L_S) encountered in MCMC.)
-
-    This is a demonstration. In production, you might refine or optimize
-    acceptance thresholds, do parallel chains, etc.
     """
     device = L.device
     T = L.shape[0]
