@@ -8,6 +8,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch._dynamo  # for @torch._dynamo.skip
 from dataclasses import dataclass
 from typing import Optional, List
 
@@ -15,11 +16,12 @@ from typing import Optional, List
 # 1) MCMC-based approximate DPP sampling (for large T)
 ############################################################
 
+@torch._dynamo.skip
 def mcmc_conditional_dpp_sample(
     L: torch.Tensor,
     i: int,
-    mcmc_steps: int=50,
-    init_subsets: int=3
+    mcmc_steps: int = 50,
+    init_subsets: int = 3
 ) -> List[int]:
     """
     Approximate conditional DPP sampling via Markov Chain Monte Carlo (MCMC).
@@ -38,53 +40,48 @@ def mcmc_conditional_dpp_sample(
     Returns:
       A single subset (list of indices) that includes i.
       (We pick whichever subset has the highest det(L_S) encountered in MCMC.)
-
-    This is a demonstration. In production, you might refine or optimize
-    acceptance thresholds, do parallel chains, etc.
     """
     device = L.device
     T = L.shape[0]
     best_subset = [i]
     best_det = 0.0
 
-    # We'll do multiple restarts to reduce local minima
+    def subset_det(S) -> torch.Tensor:
+        if not S:
+            return torch.tensor(0.0, device=device)
+        idx = torch.tensor(list(S), device=device)
+        # cast to float32 for stable determinant
+        Ls = L[idx][:, idx].float()
+        val = torch.linalg.det(Ls)
+        # clamp at zero in case of tiny negative numerical fuzz
+        return torch.clamp_min(val, 0.0)
+
     for _ in range(init_subsets):
-        # Initialize with subset that has i plus maybe a few random items
+        # Initialize with subset that has i plus maybe random items
         subset = set([i])
-        # add random items with prob 0.3
         for t_ in range(T):
             if t_ != i and random.random() < 0.3:
                 subset.add(t_)
 
-        def subset_det(S):
-            if len(S) == 0:
-                return 0.0
-            idx = torch.tensor(list(S), device=device)
-            Ls = L[idx][:, idx].float()  # cast to float
-            val = torch.linalg.det(Ls)
-            return max(val.item(), 0.0)
-
-        cur_det = subset_det(subset)
+        cur_det = subset_det(subset).detach().cpu().item()
 
         # MCMC
         for _step in range(mcmc_steps):
-            # pick an item to flip (add or remove) except i
             cand = random.randint(0, T-1)
             if cand == i:
                 continue
             new_subset = set(subset)
             if cand in new_subset:
-                # propose removing it
                 new_subset.remove(cand)
             else:
-                # propose adding it
                 new_subset.add(cand)
-            new_det = subset_det(new_subset)
-            # acceptance ratio = new_det / old_det
+
+            new_det = subset_det(new_subset).detach().cpu().item()
             if cur_det <= 1e-12:
-                accept_prob = 1.0 if new_det > 0 else 0
+                accept_prob = 1.0 if new_det > 0.0 else 0.0
             else:
                 accept_prob = min(1.0, new_det / cur_det)
+
             if random.random() < accept_prob:
                 subset = new_subset
                 cur_det = new_det
@@ -95,7 +92,8 @@ def mcmc_conditional_dpp_sample(
 
     return best_subset
 
-def spectral_conditional_dpp_sample(L: torch.Tensor, i: int, tries: int=10) -> List[int]:
+@torch._dynamo.skip
+def spectral_conditional_dpp_sample(L: torch.Tensor, i: int, tries: int = 10) -> List[int]:
     """
     Fallback exact spectral sampling for smaller T.
     Repeatedly sample from the DPP until we get a subset that includes i.
@@ -108,26 +106,26 @@ def spectral_conditional_dpp_sample(L: torch.Tensor, i: int, tries: int=10) -> L
             return S
     return [i]
 
+@torch._dynamo.skip
 def dpp_sample_spectral(L: torch.Tensor) -> List[int]:
     """
     Exact spectral DPP sampling (without conditioning). O(T^3).
     Standard approach: eigen-decompose, pick eigenvectors, iterative item inclusion.
     """
-    # Force float for eigen-decomposition
     L_fp32 = L.float()
     w, V = torch.linalg.eigh(L_fp32)
-    # clip negative eigenvalues just in case of numerical issues
-    w = torch.clip(w, min=0.0)
+    # clip negative eigenvalues in case of numerical issues
+    w = torch.clamp_min(w, 0.0)
 
-    keep = []
+    keep_mask = []
     for lam in w:
         p = lam / (1.0 + lam)
         if torch.rand(1, device=L.device) < p:
-            keep.append(True)
+            keep_mask.append(True)
         else:
-            keep.append(False)
+            keep_mask.append(False)
 
-    chosen_evecs = V[:, keep]
+    chosen_evecs = V[:, keep_mask]
     if chosen_evecs.shape[1] == 0:
         return []
 
@@ -142,9 +140,10 @@ def dpp_sample_spectral(L: torch.Tensor) -> List[int]:
             accept_prob = proj / chosen_evecs.shape[1]
         else:
             accept_prob = 0.0
+
         if torch.rand(1, device=L.device) < accept_prob:
             subset.append(it)
-            # For strict correctness we'd remove that direction. We skip it => approximate.
+            # Skipping re-orthonormalization for brevity => approximate.
 
     return sorted(subset)
 
@@ -152,113 +151,104 @@ def dpp_sample_spectral(L: torch.Tensor) -> List[int]:
 # 2) Unfixed-size aggregator for token i
 ############################################################
 
+@torch._dynamo.skip
 def aggregator_for_token_i_unfixed(
     i: int,
     L: torch.Tensor,
     v: torch.Tensor,
-    n_subs: int=3,
-    small_thresh: int=64,
-    mcmc_steps: int=50,
-    window_mask: Optional[torch.Tensor]=None
+    n_subs: int = 3,
+    small_thresh: int = 64,
+    mcmc_steps: int = 50,
+    window_mask: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """
     For each token i, sample up to n_subs subsets from an unconstrained DPP
-    that must contain i. Each subset can be any size. Weighted aggregator:
-      sum_{S}( det(L_S) * mean(v_j : j in S ) ) / sum_{S} det(L_S).
+    that must contain i. Weighted aggregator:
+        sum_{S}( det(L_S) * mean(v_j : j in S ) ) / sum_{S} det(L_S)
+    with S possibly any size >= 1.
 
     We do either:
       - exact spectral approach if T <= small_thresh
       - MCMC approach otherwise
-    We skip subsets that contain any disallowed item from `window_mask` (if provided).
+    We skip subsets that contain disallowed items from `window_mask`.
 
     Args:
-      i: forced item
+      i: forced item index
       L: [T, T] kernel
       v: [T, d] values
       n_subs: how many subsets to sample
       small_thresh: if local T <= this => exact spectral => otherwise MCMC
-      mcmc_steps: number of MCMC updates for large T
+      mcmc_steps: steps for MCMC approach
       window_mask: [T], 1=allowed, 0=excluded from subset
 
     Returns:
-      aggregator [d]
+      aggregator of shape [d]
     """
     device = L.device
     T, d = v.shape
 
-    subsets = []
-    def subset_det(S):
-        if len(S) == 0:
-            return 0.0
+    def subset_det(S) -> torch.Tensor:
+        if not S:
+            return torch.tensor(0.0, device=device)
         idx = torch.tensor(list(S), device=device)
-        # cast to float32
+        # cast to float32 for stable determinant
         Ls = L[idx][:, idx].float()
-        dt = torch.linalg.det(Ls)
-        return max(dt.item(), 0.0)
+        val = torch.linalg.det(Ls)
+        return torch.clamp_min(val, 0.0)
 
-    # We'll try up to 3*n_subs attempts to gather distinct subsets
+    subsets = []
     tries_per_sub = 3 * n_subs
     for _ in range(tries_per_sub):
         if T <= small_thresh:
-            # exact spectral fallback
             S = spectral_conditional_dpp_sample(L, i)
         else:
-            # approximate MCMC
             S = mcmc_conditional_dpp_sample(L, i, mcmc_steps=mcmc_steps)
-        # filter out disallowed items
         if window_mask is not None:
             S = [x for x in S if window_mask[x].item() == 1]
             if i not in S:
                 S = [i]
+
+        # gather distinct subsets
         if S not in subsets:
             subsets.append(S)
         if len(subsets) >= n_subs:
             break
 
-    if len(subsets) == 0:
-        # fallback
+    if not subsets:
         subsets = [[i]]
 
-    weights = []
+    # build a tensor for the weights
+    weight_list = []
     sub_avgs = []
     for S_ in subsets:
         dt = subset_det(S_)
         idx = torch.tensor(S_, device=device)
         if len(S_) > 0:
-            mean_v = v[idx].mean(dim=0)
+            avg_v = v[idx].mean(dim=0)
         else:
-            mean_v = v.new_zeros(d)
-        weights.append(dt)
-        sub_avgs.append(mean_v)
+            avg_v = torch.zeros(d, device=device)
+        weight_list.append(dt)      # 0D tensor
+        sub_avgs.append(avg_v)      # [d]
 
-    w_t = torch.tensor(weights, device=device)
+    # stack 0D weights along dim=0
+    w_t = torch.stack(weight_list, dim=0)  # shape [#subsets]
     denom = w_t.sum() + 1e-9
     out = torch.zeros(d, device=device)
-    for idx_s, av_ in enumerate(sub_avgs):
-        out += (w_t[idx_s] / denom) * av_
+    for i_sub, avg_v in enumerate(sub_avgs):
+        out += (w_t[i_sub] / denom) * avg_v
+
     return out
 
 ############################################################
-# 3) CausalSelfAttentionDPP that handles variable-size subsets
-#    + local window for large T
-#    + chunking
+# 3) CausalSelfAttentionDPP
 ############################################################
 
 class CausalSelfAttentionDPP(nn.Module):
     """
-    Production-oriented:
-      - We do a local "window" or "top" filtering if T is large,
-        to avoid building L for all T tokens at once.
-      - We chunk the query dimension in slices to reduce memory usage.
-      - We apply a synergy aggregator that does an unconstrained DPP sample
-        conditioned on i in S.
-
-    Config:
-      local_window: if >0, we only allow j in [i-window, i], or similar local region.
-      n_subs: how many subsets to sample per token aggregator
-      small_thresh: if local T <= small_thresh => exact spectral => otherwise MCMC
-      mcmc_steps: number of MCMC steps
-      chunk_size: chunk dimension for queries
+    Production-oriented synergy-based DPP attention:
+      - local window & chunking to keep memory in check
+      - MCMC or spectral for sampling
+      - aggregator_for_token_i_unfixed for synergy
     """
 
     def __init__(
@@ -266,14 +256,14 @@ class CausalSelfAttentionDPP(nn.Module):
         n_embd: int,
         n_head: int,
         block_size: int,
-        dropout: float=0.1,
-        bias: bool=True,
+        dropout: float = 0.1,
+        bias: bool = True,
         # synergy config
-        local_window: int=64,
-        n_subs: int=3,
-        small_thresh: int=64,
-        mcmc_steps: int=50,
-        chunk_size: int=32,
+        local_window: int = 64,
+        n_subs: int = 3,
+        small_thresh: int = 64,
+        mcmc_steps: int = 50,
+        chunk_size: int = 32,
     ):
         super().__init__()
         assert n_embd % n_head == 0
@@ -299,10 +289,6 @@ class CausalSelfAttentionDPP(nn.Module):
         self.register_buffer("bias", tri.view(1, 1, block_size, block_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, T, C]
-        returns [B, T, C]
-        """
         B, T, C = x.shape
         assert T <= self.block_size
 
@@ -313,10 +299,10 @@ class CausalSelfAttentionDPP(nn.Module):
 
         out = torch.zeros_like(q)
 
-        # 2D causal mask
-        causal_2d = self.bias[:, :, :T, :T][0, 0]  # shape [T,T], 1=allowed
+        # 2D causal mask (1=allowed, 0=disallowed)
+        causal_2d = self.bias[:, :, :T, :T][0, 0]  # shape [T, T]
 
-        # We'll chunk over T in the query dimension
+        # chunk the query dimension to limit Python loop overhead
         num_chunks = (T + self.chunk_size - 1) // self.chunk_size
 
         for bidx in range(B):
@@ -327,40 +313,37 @@ class CausalSelfAttentionDPP(nn.Module):
                 row_out = []
                 for cidx in range(num_chunks):
                     start = cidx * self.chunk_size
-                    end = min(T, (cidx+1) * self.chunk_size)
+                    end = min(T, (cidx + 1) * self.chunk_size)
                     chunk_outputs = []
                     for i_rel in range(end - start):
                         i_ = start + i_rel
 
-                        # define local range [i_-window+1, i_]
+                        # define local range [i_-window+1 ... i_]
                         if self.local_window > 0:
                             left = max(0, i_ - self.local_window + 1)
                         else:
                             left = 0
                         right = i_ + 1
                         cand_idx = list(range(left, right))
-                        # apply causal mask
+                        # enforce causal mask => j <= i_
                         cand_idx = [j for j in cand_idx if causal_2d[i_, j] == 1]
-                        if len(cand_idx) == 0:
+                        if not cand_idx:
+                            # fallback
                             chunk_outputs.append(v_bh[i_].unsqueeze(0))
                             continue
 
                         local_q = q_bh[cand_idx]  # [local_T, head_size]
-                        # local kernel
-                        L_local = local_q @ local_q.transpose(0, 1)
-                        scale = 1.0 / math.sqrt(self.head_size)
-                        L_local = L_local * scale
+                        L_local = local_q @ local_q.transpose(0, 1)  # [local_T, local_T]
+                        L_local *= (1.0 / math.sqrt(self.head_size))
 
-                        # build local v
                         local_v = v_bh[cand_idx]  # [local_T, head_size]
 
                         if i_ not in cand_idx:
-                            # if i_ is excluded by mask => fallback
+                            # if i_ is outside the local subset => fallback
                             chunk_outputs.append(v_bh[i_].unsqueeze(0))
                             continue
 
                         i_offset = cand_idx.index(i_)
-
                         up_i = aggregator_for_token_i_unfixed(
                             i=i_offset,
                             L=L_local,
@@ -370,8 +353,10 @@ class CausalSelfAttentionDPP(nn.Module):
                             mcmc_steps=self.mcmc_steps,
                         )
                         chunk_outputs.append(up_i.unsqueeze(0))
+
                     chunk_outputs = torch.cat(chunk_outputs, dim=0)  # [chunk_size, head_size]
                     row_out.append(chunk_outputs)
+
                 row_out = torch.cat(row_out, dim=0)  # [T, head_size]
                 out[bidx, hidx] = row_out
 
@@ -413,14 +398,14 @@ class Block(nn.Module):
         n_embd: int,
         n_head: int,
         block_size: int,
-        dropout: float=0.1,
-        bias: bool=True,
+        dropout: float = 0.1,
+        bias: bool = True,
         # synergy config
-        local_window: int=64,
-        n_subs: int=3,
-        small_thresh: int=64,
-        mcmc_steps: int=50,
-        chunk_size: int=32
+        local_window: int = 64,
+        n_subs: int = 3,
+        small_thresh: int = 64,
+        mcmc_steps: int = 50,
+        chunk_size: int = 32
     ):
         super().__init__()
         self.ln_1 = LayerNorm(n_embd, bias=bias)
@@ -470,33 +455,35 @@ class GPT(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
-        self.transformer = nn.ModuleDict(dict(
-            wte=nn.Embedding(config.vocab_size, config.n_embd),
-            wpe=nn.Embedding(config.block_size, config.n_embd),
-            drop=nn.Dropout(config.dropout),
-            h=nn.ModuleList([
-                Block(
-                    n_embd=config.n_embd,
-                    n_head=config.n_head,
-                    block_size=config.block_size,
-                    dropout=config.dropout,
-                    bias=config.bias,
-                    local_window=config.local_window,
-                    n_subs=config.n_subs,
-                    small_thresh=config.small_thresh,
-                    mcmc_steps=config.mcmc_steps,
-                    chunk_size=config.chunk_size
-                ) for _ in range(config.n_layer)
-            ]),
-            ln_f=LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        self.transformer = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(config.vocab_size, config.n_embd),
+                wpe=nn.Embedding(config.block_size, config.n_embd),
+                drop=nn.Dropout(config.dropout),
+                h=nn.ModuleList([
+                    Block(
+                        n_embd=config.n_embd,
+                        n_head=config.n_head,
+                        block_size=config.block_size,
+                        dropout=config.dropout,
+                        bias=config.bias,
+                        local_window=config.local_window,
+                        n_subs=config.n_subs,
+                        small_thresh=config.small_thresh,
+                        mcmc_steps=config.mcmc_steps,
+                        chunk_size=config.chunk_size
+                    ) for _ in range(config.n_layer)
+                ]),
+                ln_f=LayerNorm(config.n_embd, bias=config.bias),
+            )
+        )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # weight tying
         self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
 
-        # special init
+        # special scaled init for c_proj per GPT-2
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2*config.n_layer))
@@ -512,7 +499,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor]=None):
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
         b, t = idx.shape
         device = idx.device
         assert t <= self.config.block_size
@@ -534,7 +521,7 @@ class GPT(nn.Module):
                 ignore_index=-1
             )
         else:
-            # inference => last token
+            # inference => only return logits for the last token
             logits = self.lm_head(x[:, -1:, :])
             loss = None
 
@@ -543,7 +530,9 @@ class GPT(nn.Module):
     def crop_block_size(self, new_size: int):
         assert new_size <= self.config.block_size
         self.config.block_size = new_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:new_size])
+        self.transformer.wpe.weight = nn.Parameter(
+            self.transformer.wpe.weight[:new_size]
+        )
         for block in self.transformer.h:
             if hasattr(block.attn, "bias"):
                 block.attn.bias = block.attn.bias[:, :, :new_size, :new_size]
@@ -569,7 +558,7 @@ class GPT(nn.Module):
         learning_rate: float,
         betas: tuple,
         device_type: str,
-        grad_clip: Optional[float]=None
+        grad_clip: Optional[float] = None
     ):
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
@@ -581,7 +570,9 @@ class GPT(nn.Module):
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == "cuda"
 
-        base_opt = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
+        base_opt = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=betas, fused=use_fused
+        )
         print(f"[GPT] using fused AdamW: {use_fused}")
 
         if grad_clip is not None:
@@ -589,25 +580,29 @@ class GPT(nn.Module):
                 def step(self, closure=None):
                     torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip)
                     super().step(closure)
-            optimizer = ClippedAdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
+
+            optimizer = ClippedAdamW(
+                optim_groups, lr=learning_rate, betas=betas, fused=use_fused
+            )
             return optimizer
         else:
             return base_opt
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """
-        PaLM-based MFU estimate.
-        Not strictly accurate for DPP overhead, chunking, MCMC, etc.
-        But a reference point.
+        PaLM-based MFU estimate, ignoring overhead from MCMC or chunking.
+        A reference only.
         """
         N = sum(p.numel() for p in self.parameters())
         L, H = self.config.n_layer, self.config.n_head
         Q = self.config.n_embd // self.config.n_head
         T = self.config.block_size
-        flops_per_token = 6 * N + 12 * L * H * Q * T
+
+        flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         flops_achieved = flops_per_iter * (1.0 / dt)
-        # A100 BF16 ~312 TFLOPS
+
+        # A100 BF16 => ~312 TFLOPS
         flops_promised = 312e12
         return flops_achieved / flops_promised
