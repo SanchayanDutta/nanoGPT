@@ -41,7 +41,7 @@ def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
     min_size, max_size: subsets must have size in [min_size..max_size] (including i)
     top_m: only consider top-M neighbors by dot product
     temperature: softmax temperature for the distribution over subsets
-    minimize_det: if True, we do negative log-det to favor "aligned" sets
+    minimize_det: if True, we do negative log-det to favor 'aligned' sets
     penalty_alpha: exponent for dividing by subset size^penalty_alpha
     Returns: output of shape [T, head_size]
     """
@@ -63,11 +63,11 @@ def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
         topidx = valid_j[topidx_local]
 
         # 3) Enumerate all subsets that include i, of total size in [min_size..max_size].
-        #    Because i is always included, we pick (subset_size-1) from topidx (excluding i).
+        #    Because i is always included, we pick (subset_size - 1) from topidx (excluding i).
         candidates = []
         import itertools
         topidx_list = [tj for tj in topidx.tolist() if tj != i]
-        for extra_size in range(min_size-1, max_size):
+        for extra_size in range(min_size - 1, max_size):
             for csub in itertools.combinations(topidx_list, extra_size):
                 s = [i] + list(csub)
                 candidates.append(s)
@@ -87,13 +87,13 @@ def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
             log_det = torch.log(det_val + 1e-6)
             subset_size = float(len(s))
 
-            # negative if we want to "minimize" raw det => picking aligned vectors
+            # negative if we want to 'minimize' raw det => picking aligned vectors
             if minimize_det:
                 # penalty by dividing by subset_size^penalty_alpha
-                score = -log_det / (subset_size**penalty_alpha)
+                score = -log_det / (subset_size ** penalty_alpha)
             else:
                 # maximize det => log_det / (subset_size^penalty_alpha)
-                score = log_det / (subset_size**penalty_alpha)
+                score = log_det / (subset_size ** penalty_alpha)
 
             # standard attention over just s
             out_s = attention_for_subset(q_i, k[s], v[s])
@@ -223,6 +223,7 @@ class CausalSelfAttention(nn.Module):
                         penalty_alpha=self.config.dpp_penalty_alpha
                     )
                     y[b_idx, h_idx] = out_bh
+
         # [B, n_head, T, head_size]
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
@@ -282,7 +283,7 @@ class GPT(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
     def get_num_params(self, non_embedding=True):
         n_params = sum(p.numel() for p in self.parameters())
@@ -405,3 +406,19 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """
+        Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS.
+        """
+        # First estimate the number of flops per iteration (see PaLM paper Appendix B).
+        N = self.get_num_params()
+        cfg = self.config
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
+        flops_per_token = 6*N + 12*L*H*Q*T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        flops_achieved = flops_per_iter * (1.0 / dt)
+        flops_promised = 312e12  # A100 GPU bfloat16 peak flops
+        mfu = flops_achieved / flops_promised
+        return mfu
