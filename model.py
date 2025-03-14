@@ -20,7 +20,7 @@ from typing import Optional, List
 def mcmc_conditional_dpp_sample(
     L: torch.Tensor,
     i: int,
-    mcmc_steps: int = 50,
+    mcmc_steps: int = 5,
     init_subsets: int = 3
 ) -> List[int]:
     """
@@ -399,7 +399,7 @@ class GPTConfig:
     bias: bool = True
 
     # synergy-based DPP config
-    local_window: int = 64
+    local_window: int = 16
     n_subs: int = 3
     small_thresh: int = 64
     mcmc_steps: int = 50
