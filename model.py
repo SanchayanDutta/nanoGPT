@@ -187,7 +187,7 @@ class GPTConfig:
     # New DPP options
     use_dpp_attention: bool = False
     dpp_min_size: int = 2
-    dpp_max_size: int = 4
+    dpp_max_size: int = 8
     dpp_top_m: int = 8
     dpp_temperature: float = 0.1
     dpp_minimize_det: bool = True
