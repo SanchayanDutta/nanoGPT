@@ -14,7 +14,6 @@ def dpp_det_score(vecs):
     """
     Computes det(vecs @ vecs.T). Cast to float32 to avoid errors when running in bf16/half.
     """
-    # Cast to float32 first, because some backends do not implement linalg.det for bf16/half
     vecs_32 = vecs.float()
     gram = vecs_32 @ vecs_32.T
     return torch.linalg.det(gram)
@@ -31,18 +30,37 @@ def attention_for_subset(q_i, k_subset, v_subset):
     out = (w.unsqueeze(1) * v_subset).sum(dim=0)  # shape [head_size]
     return out
 
+def dpp_objective_score(E, minimize_det, penalty_alpha):
+    """
+    Computes the DPP log-determinant based objective (or negative of it),
+    with a size penalty: score = (+/-) log(det(E E^T)) / (|S|^penalty_alpha).
+    """
+    det_val = dpp_det_score(E)
+    log_det = torch.log(det_val + 1e-6)
+    subset_size = E.size(0)
+    if minimize_det:
+        # If we want to 'minimize' raw det, the objective is negative log(det).
+        # Divided by subset_size^penalty_alpha
+        score = -log_det / (subset_size ** penalty_alpha)
+    else:
+        # If we want to 'maximize' raw det, the objective is log(det).
+        # Divided by subset_size^penalty_alpha
+        score = log_det / (subset_size ** penalty_alpha)
+    return score
+
 def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
                                    temperature, minimize_det, penalty_alpha):
     """
-    A single-head, single-example version of the discrete DPP-based attention.
+    A single-head, single-example version of the discrete DPP-based attention that uses
+    a greedy selection approach instead of brute-force enumeration.
 
     q, k, v: shape [T, head_size]
     causal: if True, token i can only attend to j <= i
-    min_size, max_size: subsets must have size in [min_size..max_size] (including i)
+    min_size, max_size: subset sizes must be in [min_size..max_size] (including i)
     top_m: only consider top-M neighbors by dot product
-    temperature: softmax temperature for the distribution over subsets
-    minimize_det: if True, we do negative log-det to favor 'aligned' sets
-    penalty_alpha: exponent for dividing by subset size^penalty_alpha
+    temperature: (not used in greedy, but kept for signature compatibility)
+    minimize_det: if True, we do negative log-det (favoring alignment)
+    penalty_alpha: exponent for subset size penalty
     Returns: output of shape [T, head_size]
     """
     T, head_size = q.shape
@@ -62,63 +80,88 @@ def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
         _, topidx_local = torch.topk(sim, k=n_candidate)
         topidx = valid_j[topidx_local]
 
-        # 3) Enumerate all subsets that include i, of total size in [min_size..max_size].
-        #    Because i is always included, we pick (subset_size - 1) from topidx (excluding i).
-        candidates = []
-        import itertools
-        topidx_list = [tj for tj in topidx.tolist() if tj != i]
-        for extra_size in range(min_size - 1, max_size):
-            for csub in itertools.combinations(topidx_list, extra_size):
-                s = [i] + list(csub)
-                candidates.append(s)
+        # If topidx doesn't even contain i, ensure i is included
+        # (the code below always includes i, but we also don't want to remove i from the "candidates")
+        if i not in topidx:
+            topidx = torch.cat([topidx, i.unsqueeze(0)])
 
-        # If no valid subset, fallback to attending only to i itself
-        if len(candidates) == 0:
-            out_all[i] = v[i]
-            continue
-
-        # 4) Compute a "score" for each subset, factoring in size penalties
-        scores = []
-        outs = []
-        for s in candidates:
-            E = k[s]  # shape [subset_size, head_size]
-            det_val = dpp_det_score(E)
-            # Use log and a small epsilon to help avoid numerical issues
-            log_det = torch.log(det_val + 1e-6)
-            subset_size = float(len(s))
-
-            # negative if we want to 'minimize' raw det => picking aligned vectors
-            if minimize_det:
-                # penalty by dividing by subset_size^penalty_alpha
-                score = -log_det / (subset_size ** penalty_alpha)
-            else:
-                # maximize det => log_det / (subset_size^penalty_alpha)
-                score = log_det / (subset_size ** penalty_alpha)
-
-            # standard attention over just s
-            out_s = attention_for_subset(q_i, k[s], v[s])
-            scores.append(score)
-            outs.append(out_s)
-
-        scores_tensor = torch.stack(scores, dim=0)  # shape [num_subsets]
-        # 5) Softmax distribution
-        probs = F.softmax(scores_tensor / temperature, dim=0)  # shape [num_subsets]
-        # 6) Straight-through: pick argmax in forward pass
-        best_idx = probs.argmax()
-        y_st = outs[best_idx]  # discrete choice
-        # Weighted average used for gradient
-        y_soft = torch.stack(outs, dim=0)
-        y_soft = (probs.unsqueeze(1) * y_soft).sum(dim=0)
-        # Combine
-        y = y_st + (y_soft - y_st).detach()
-
-        out_all[i] = y
+        # 3) Greedy selection of subset S that always includes i
+        # We'll define a local function to do that selection for the i-th token
+        # Note: we only pick from topidx; that is the candidate pool.
+        chosen_out = _greedy_select_and_attention(
+            i, q_i, k, v, topidx, min_size, max_size, minimize_det, penalty_alpha
+        )
+        out_all[i] = chosen_out
 
     return out_all
 
+def _greedy_select_and_attention(i, q_i, k, v, top_candidates, min_size, max_size,
+                                 minimize_det, penalty_alpha):
+    """
+    Internal helper: picks a subset that always includes 'i' using a greedy approach
+    and returns the standard attention result over that subset.
+    """
+    S = [i]  # Always include current token i
+    current_score = dpp_objective_score(k[S], minimize_det, penalty_alpha)
+
+    # Convert top_candidates to list for iteration
+    top_candidates_list = set(top_candidates.tolist())
+    # Make sure i is not re-picked
+    if i in top_candidates_list:
+        top_candidates_list.remove(i)
+
+    while len(S) < max_size:
+        best_candidate = None
+        best_candidate_score = None  # We'll track the objective after adding candidate
+
+        # Test adding each candidate c not already in S
+        for c in top_candidates_list:
+            newS = S + [c]
+            new_score = dpp_objective_score(k[newS], minimize_det, penalty_alpha)
+
+            # For minimize_det == True, 'score' is negative if determinant is large,
+            # so the "better" subset has a smaller numeric value of new_score.
+            # For minimize_det == False, bigger numeric value is better.
+            if best_candidate_score is None:
+                best_candidate = c
+                best_candidate_score = new_score
+            else:
+                if not minimize_det and new_score > best_candidate_score:
+                    best_candidate = c
+                    best_candidate_score = new_score
+                elif minimize_det and new_score < best_candidate_score:
+                    best_candidate = c
+                    best_candidate_score = new_score
+
+        # If we found no candidate, just break
+        if best_candidate is None:
+            break
+
+        # See if the best candidate actually improves the score
+        # If not, we stop (unless we haven't reached min_size yet).
+        if minimize_det:
+            improvement_found = (best_candidate_score < current_score)
+        else:
+            improvement_found = (best_candidate_score > current_score)
+
+        if improvement_found or (len(S) < min_size):
+            # Accept the new candidate
+            S.append(best_candidate)
+            top_candidates_list.remove(best_candidate)
+            current_score = best_candidate_score
+        else:
+            # No improvement, and we have at least min_size
+            break
+
+    # Now we have subset S. Do standard attention over S.
+    out_s = attention_for_subset(q_i, k[S], v[S])
+
+    # Straight-through version: we'll treat out_s as final. If you'd like
+    # a "soft" distribution across possible subsets, you'd modify this part.
+    return out_s
 
 #
-# The rest: original GPT code, plus the new config flags and updated CausalSelfAttention
+# The rest: original GPT code, with no changes aside from calling our new DPP function
 #
 
 class LayerNorm(nn.Module):
@@ -149,7 +192,6 @@ class GPTConfig:
     dpp_temperature: float = 0.1
     dpp_minimize_det: bool = True
     dpp_penalty_alpha: float = 1.0
-
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -202,19 +244,17 @@ class CausalSelfAttention(nn.Module):
                 att = self.attn_dropout(att)
                 y = att @ v
         else:
-            # DPP-based approach, straight-through, subsets of size [2..3]
-            # We'll do it token-by-token for each batch, each head
-            # Very slow demonstration code
+            # Use our new DPP-based approach with greedy selection
             y = torch.zeros_like(q)
             for b_idx in range(B):
                 for h_idx in range(self.n_head):
                     qbh = q[b_idx, h_idx]  # [T, head_size]
                     kbh = k[b_idx, h_idx]
                     vbh = v[b_idx, h_idx]
-                    # run the discrete approach
+                    # Run the discrete approach
                     out_bh = dpp_straight_through_attention(
                         qbh, kbh, vbh,
-                        causal=True,  # or False if you want a non-causal variant
+                        causal=True,  # or False if you want non-causal
                         min_size=self.config.dpp_min_size,
                         max_size=self.config.dpp_max_size,
                         top_m=self.config.dpp_top_m,
@@ -411,7 +451,6 @@ class GPT(nn.Module):
         """
         Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS.
         """
-        # First estimate the number of flops per iteration (see PaLM paper Appendix B).
         N = self.get_num_params()
         cfg = self.config
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
