@@ -41,11 +41,11 @@ def dpp_objective_score(E, minimize_det, penalty_alpha):
     if minimize_det:
         # If we want to 'minimize' raw det, the objective is negative log(det).
         # Divided by subset_size^penalty_alpha
-        score = -log_det / (subset_size ** penalty_alpha)
+        score = log_det / (subset_size ** penalty_alpha)
     else:
         # If we want to 'maximize' raw det, the objective is log(det).
         # Divided by subset_size^penalty_alpha
-        score = log_det / (subset_size ** penalty_alpha)
+        score = -log_det / (subset_size ** penalty_alpha)
     return score
 
 def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
@@ -58,7 +58,7 @@ def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
     causal: if True, token i can only attend to j <= i
     min_size, max_size: subset sizes must be in [min_size..max_size] (including i)
     top_m: only consider top-M neighbors by dot product
-    temperature: (not used in greedy, but kept for signature compatibility)
+    temperature: (not used in greedy, but we keep it for signature compatibility)
     minimize_det: if True, we do negative log-det (favoring alignment)
     penalty_alpha: exponent for subset size penalty
     Returns: output of shape [T, head_size]
@@ -156,8 +156,7 @@ def _greedy_select_and_attention(i, q_i, k, v, top_candidates, min_size, max_siz
     # Now we have subset S. Do standard attention over S.
     out_s = attention_for_subset(q_i, k[S], v[S])
 
-    # Straight-through version: we'll treat out_s as final. If you'd like
-    # a "soft" distribution across possible subsets, you'd modify this part.
+    # Straight-through version: we'll treat out_s as final.
     return out_s
 
 #
