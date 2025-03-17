@@ -58,7 +58,7 @@ def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
     causal: if True, token i can only attend to j <= i
     min_size, max_size: subset sizes must be in [min_size..max_size] (including i)
     top_m: only consider top-M neighbors by dot product
-    temperature: (not used in greedy, but kept for signature compatibility)
+    temperature: (not used in greedy, but we keep it for signature compatibility)
     minimize_det: if True, we do negative log-det (favoring alignment)
     penalty_alpha: exponent for subset size penalty
     Returns: output of shape [T, head_size]
