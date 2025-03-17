@@ -19,39 +19,20 @@ def soft_dpp_regularization(att_weights, key_vectors, reg_lambda=0.01):
     Returns a scalar DPP penalty that encourages attention to be spread out
     (or concentrated, depending on sign). Typically, you add this to the loss.
     """
-    # We can treat att_weights as a diagonal inside a "weighted" Gram matrix
-    # Weighted Gram = diag(att_weights) * (K K^T) * diag(att_weights).
-    # That is effectively (sqrt of diag(att_weights)) * K * K^T * (sqrt of diag(att_weights)).
-    # We then take log-det to get a measure of diversity. We add a negative sign if we
-    # want to *increase* that diversity (similar to "maximize det"), or keep it as is
-    # if we want to encourage the distribution to concentrate. It depends on your design.
-    #
-    # Usually we do a negative sign, so that a larger det leads to more negative penalty,
-    # which in turn the optimization tries to minimize, thus *increasing* the determinant.
-    # But you can also flip the sign if you want the opposite effect.
-
-    # Weighted key vectors by att_weights^0.5
-    # shape: [T, 1] * [T, head_size] => broadcast => [T, head_size]
     sqrt_w = torch.sqrt(att_weights + 1e-8).unsqueeze(1)  # [T, 1]
     weighted_k = sqrt_w * key_vectors  # [T, head_size]
 
-    # Now build the Gram matrix: G = weighted_k @ weighted_k.T
-    # Then log_det(G)
-    G = weighted_k @ weighted_k.T  # shape [T, T]
-    # For numerical stability, add tiny epsilon to diagonal
+    G = weighted_k @ weighted_k.T  # [T, T]
     G = G + 1e-6 * torch.eye(G.size(0), device=G.device)
     det_val = torch.linalg.det(G.float())
     log_det = torch.log(det_val + 1e-8)
 
-    # The final penalty. Typically we do a negative sign to *encourage* a larger determinant:
-    penalty = -1.0 * log_det  # negative means we want the model to maximize the det
-
-    # Scale by reg_lambda
+    # Negative sign so the model is encouraged to MAXIMIZE the determinant
+    penalty = -1.0 * log_det
     return reg_lambda * penalty
 
-
 #
-# Modified attention that returns both the output and a DPP penalty term
+# A Causal Self-Attention module with an additional soft-DPP penalty
 #
 
 class SoftDPPCausalSelfAttention(nn.Module):
@@ -66,22 +47,14 @@ class SoftDPPCausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-
-        # For older PyTorch versions, we do manual masking
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(config.block_size, config.block_size))
             .view(1, 1, config.block_size, config.block_size)
         )
-
-        # Weight for the soft DPP penalty
         self.dpp_reg_lambda = getattr(config, "dpp_reg_lambda", 0.01)
 
     def forward(self, x, return_dpp_penalty=False):
-        """
-        x: [B, T, C]
-        return_dpp_penalty: if True, we'll also return the total DPP penalty (summed across heads).
-        """
         B, T, C = x.size()
         qkv = self.c_attn(x)  # [B, T, 3*C]
         q, k, v = qkv.split(self.n_embd, dim=2)
@@ -91,37 +64,24 @@ class SoftDPPCausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, head_size).transpose(1, 2)
         v = v.view(B, T, self.n_head, head_size).transpose(1, 2)
 
-        # Manual (slow) causal attention
-        # shape of att = [B, n_head, T, T]
+        # manual causal attention
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)  # [B, n_head, T, T]
+        att = self.attn_dropout(att)
 
-        # Compute the DPP penalty if asked
         dpp_penalty = 0.0
         if return_dpp_penalty and self.dpp_reg_lambda > 0:
-            # We sum penalty across all heads and all batch elements
-            # att[b, h, i, :] are the attention weights for token i of head h in batch b
-            # k[b, h, :, :] are the key vectors for that head
             for b_idx in range(B):
                 for h_idx in range(self.n_head):
-                    # We can either average penalty across T or sum it
-                    # Typically we sum so that each query contributes
-                    # you may prefer an average if you want to scale differently
-                    batch_head_penalty = 0.0
                     kbh = k[b_idx, h_idx]  # shape [T, head_size]
                     for i_idx in range(T):
-                        w_i = att[b_idx, h_idx, i_idx]  # shape [T], distribution for that query
-                        # Soft DPP penalty for this distribution
-                        batch_head_penalty = batch_head_penalty + soft_dpp_regularization(
+                        w_i = att[b_idx, h_idx, i_idx]  # shape [T]
+                        dpp_penalty += soft_dpp_regularization(
                             w_i, kbh, reg_lambda=self.dpp_reg_lambda
                         )
-                    dpp_penalty = dpp_penalty + batch_head_penalty
 
-        # standard attention output
         y = att @ v  # [B, n_head, T, head_size]
-
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
 
@@ -176,7 +136,6 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, return_dpp_penalty=False):
-        # If we're collecting DPP penalties, pass the flag down
         if not return_dpp_penalty:
             x = x + self.attn(self.ln_1(x))
             x = x + self.mlp(self.ln_2(x))
@@ -207,7 +166,9 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(
+                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
+                )
 
         print(f"number of parameters: {self.get_num_params() / 1e6:.2f}M")
 
@@ -226,13 +187,11 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None, return_dpp_penalty=False):
-        """
-        return_dpp_penalty: if True, we also collect the sum of all DPP penalties
-                            across layers and return it as a separate value.
-        """
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is {self.config.block_size}"
+        assert t <= self.config.block_size, (
+            f"Cannot forward sequence of length {t}, block size is {self.config.block_size}"
+        )
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         tok_emb = self.transformer.wte(idx)
@@ -246,18 +205,22 @@ class GPT(nn.Module):
         else:
             for block in self.transformer.h:
                 x, block_penalty = block(x, return_dpp_penalty=True)
-                total_dpp_penalty = total_dpp_penalty + block_penalty
+                total_dpp_penalty += block_penalty
 
         x = self.transformer.ln_f(x)
 
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1
+            )
             if return_dpp_penalty:
-                # Combine the standard cross-entropy loss with the DPP penalty
-                # Typically we just add them, but you might want a weighting factor
-                # if dpp_reg_lambda is not enough.
+                # Combine with the DPP penalty. 
+                # If dpp_reg_lambda is already in place, you may do just: loss += total_dpp_penalty
+                # or you can do custom weighting here, depending on your preference.
                 loss = loss + total_dpp_penalty
 
         if return_dpp_penalty:
@@ -268,10 +231,20 @@ class GPT(nn.Module):
     def crop_block_size(self, block_size):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        self.transformer.wpe.weight = nn.Parameter(
+            self.transformer.wpe.weight[:block_size]
+        )
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
+
+    @classmethod
+    def from_pretrained(cls, model_type, override_args=None):
+        """
+        Dummy version if needed for HF. 
+        If you do not need HF loading, you can remove or update this method.
+        """
+        raise NotImplementedError("from_pretrained not implemented in this example")
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
@@ -279,19 +252,25 @@ class GPT(nn.Module):
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+            {'params': nodecay_params, 'weight_decay': 0.0},
         ]
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=betas, **extra_args
+        )
         print(f"Using fused AdamW: {use_fused}")
         return optimizer
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            idx_cond = (
+                idx
+                if idx.size(1) <= self.config.block_size
+                else idx[:, -self.config.block_size:]
+            )
             logits, _ = self(idx_cond, targets=None, return_dpp_penalty=False)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
@@ -301,3 +280,25 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """
+        Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS.
+        This is adapted from the original nanoGPT code.
+        
+        fwdbwd_per_iter: how many forward/backward passes happen in one iteration
+        dt: the time (in seconds) that one iteration took
+        """
+        N = self.get_num_params()
+        cfg = self.config
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
+        # per token: 
+        # 6*N for all the matmuls related to the parameters, plus 
+        # 12*L*H*Q*T for the attention overhead
+        flops_per_token = 6 * N + 12 * L * H * Q * T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        flops_achieved = flops_per_iter * (1.0 / dt)
+        flops_promised = 312e12  # A100 GPU bfloat16 peak flops
+        mfu = flops_achieved / flops_promised
+        return mfu
