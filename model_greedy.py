@@ -156,8 +156,7 @@ def _greedy_select_and_attention(i, q_i, k, v, top_candidates, min_size, max_siz
     # Now we have subset S. Do standard attention over S.
     out_s = attention_for_subset(q_i, k[S], v[S])
 
-    # Straight-through version: we'll treat out_s as final. If you'd like
-    # a "soft" distribution across possible subsets, you'd modify this part.
+    # Straight-through version: we'll treat out_s as final.
     return out_s
 
 #
