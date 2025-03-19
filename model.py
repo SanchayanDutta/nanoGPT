@@ -166,8 +166,8 @@ class GPTConfig:
     # Even if 'use_dpp_attention' is here, we will treat it as always True below.
     use_dpp_attention: bool = True
     dpp_min_size: int = 2
-    dpp_max_size: int = 8
-    dpp_top_m: int = 8
+    dpp_max_size: int = 64
+    dpp_top_m: int = 64
     dpp_temperature: float = 0.1
     dpp_minimize_det: bool = True
     dpp_penalty_alpha: float = 1.0
