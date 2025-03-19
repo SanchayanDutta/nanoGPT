@@ -185,11 +185,11 @@ class GPTConfig:
 
     # New DPP options
     use_dpp_attention: bool = False
-    dpp_min_size: int = 3
+    dpp_min_size: int = 2
     dpp_max_size: int = 8
     dpp_top_m: int = 16
     dpp_temperature: float = 0.1
-    dpp_minimize_det: bool = True
+    dpp_minimize_det: bool = False
     dpp_penalty_alpha: float = 0.0
 
 class CausalSelfAttention(nn.Module):
