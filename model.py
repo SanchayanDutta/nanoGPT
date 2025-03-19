@@ -189,7 +189,7 @@ class GPTConfig:
     dpp_max_size: int = 64
     dpp_top_m: int = 64
     dpp_temperature: float = 0.1
-    dpp_minimize_det: bool = True
+    dpp_minimize_det: bool = False
     dpp_penalty_alpha: float = 0.0
 
 class CausalSelfAttention(nn.Module):
