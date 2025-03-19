@@ -6,24 +6,41 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# If you're using torch.compile, import torch._dynamo:
+try:
+    import torch._dynamo
+    dynamo_available = True
+except ImportError:
+    dynamo_available = False
+
 #
 # Helper functions for the DPP-based approach
 #
 
-def dpp_det_score(vecs):
-    """
-    Computes det(vecs @ vecs.T). Cast to float32 to avoid errors when running in bf16/half.
-    """
-    vecs_32 = vecs.float()
-    gram = vecs_32 @ vecs_32.T
-    return torch.linalg.det(gram)
+if dynamo_available:
+    @torch._dynamo.disable()
+    def dpp_det_score(vecs):
+        """
+        Computes det(vecs @ vecs.T). We'll cast to float64 to avoid any BF16 issues,
+        then cast the final determinant result back to float32.
+        """
+        vecs_64 = vecs.to(torch.float64)
+        gram = vecs_64 @ vecs_64.T
+        det_val_64 = torch.linalg.det(gram)
+        return det_val_64.float()
+else:
+    def dpp_det_score(vecs):
+        vecs_64 = vecs.to(torch.float64)
+        gram = vecs_64 @ vecs_64.T
+        det_val_64 = torch.linalg.det(gram)
+        return det_val_64.float()
 
 def dpp_objective_score(E, minimize_det, penalty_alpha):
     """
     Computes the DPP log-determinant-based objective (or negative of it),
     with a size penalty: score = (+/-) log(det(E E^T)) / (|S|^penalty_alpha).
     """
-    det_val = dpp_det_score(E)
+    det_val = dpp_det_score(E)  # now always float32 on return
     log_det = torch.log(det_val + 1e-6)
     subset_size = E.size(0)
     if minimize_det:
@@ -32,111 +49,180 @@ def dpp_objective_score(E, minimize_det, penalty_alpha):
         score = log_det / (subset_size ** penalty_alpha)
     else:
         # If we want to 'maximize' raw det, the objective is log(det).
-        # Divided by subset_size^penalty_alpha
         score = -log_det / (subset_size ** penalty_alpha)
     return score
 
-def _greedy_select_and_aggregate(i, k, v, top_candidates, min_size, max_size,
-                                 minimize_det, penalty_alpha):
-    """
-    Internal helper: picks a subset that always includes 'i' using a greedy approach
-    and returns the aggregate of those vectors (no softmax-based attention).
-    """
-    S = [i]  # Always include current token i
-    current_score = dpp_objective_score(k[S], minimize_det, penalty_alpha)
+if dynamo_available:
+    @torch._dynamo.disable()
+    def _greedy_select_and_aggregate(i, k, v, top_candidates, min_size, max_size,
+                                     minimize_det, penalty_alpha):
+        """
+        Internal helper: picks a subset that always includes 'i' using a greedy approach
+        and returns the average of those vectors (no softmax).
+        
+        Using torch._dynamo.disable() to avoid graph breaks in dynamic Python logic.
+        """
+        # We'll store top_candidates as a Python list so we can do membership checks:
+        top_candidates_list = top_candidates.tolist()
 
-    # Convert to a mutable set
-    top_candidates_list = set(top_candidates.tolist())
-    if i in top_candidates_list:
-        top_candidates_list.remove(i)
+        # Make sure i is included
+        if i not in top_candidates_list:
+            top_candidates_list.append(i)
 
-    while len(S) < max_size:
-        best_candidate = None
-        best_candidate_score = None
+        # Convert to a Python set for O(1) "remove" etc.
+        top_candidates_set = set(top_candidates_list)
 
-        for c in top_candidates_list:
-            newS = S + [c]
-            new_score = dpp_objective_score(k[newS], minimize_det, penalty_alpha)
+        S = [i]  # Always include current token i
+        current_score = dpp_objective_score(k[S], minimize_det, penalty_alpha)
+        if i in top_candidates_set:
+            top_candidates_set.remove(i)
 
-            # For minimize_det == True, a smaller numeric value is better (negative log-det).
-            # For minimize_det == False, a larger numeric value is better (log-det).
-            if best_candidate_score is None:
-                best_candidate = c
-                best_candidate_score = new_score
+        while len(S) < max_size:
+            best_candidate = None
+            best_candidate_score = None
+
+            # Try every candidate still in the set
+            for c in list(top_candidates_set):
+                newS = S + [c]
+                new_score = dpp_objective_score(k[newS], minimize_det, penalty_alpha)
+
+                if best_candidate_score is None:
+                    best_candidate = c
+                    best_candidate_score = new_score
+                else:
+                    if not minimize_det and new_score > best_candidate_score:
+                        best_candidate = c
+                        best_candidate_score = new_score
+                    elif minimize_det and new_score < best_candidate_score:
+                        best_candidate = c
+                        best_candidate_score = new_score
+
+            if best_candidate is None:
+                break
+
+            if minimize_det:
+                improvement_found = (best_candidate_score < current_score)
             else:
-                if not minimize_det and new_score > best_candidate_score:
+                improvement_found = (best_candidate_score > current_score)
+
+            if improvement_found or (len(S) < min_size):
+                S.append(best_candidate)
+                top_candidates_set.remove(best_candidate)
+                current_score = best_candidate_score
+            else:
+                break
+
+        # Instead of standard attention, we just average the chosen vectors.
+        out_s = v[S].mean(dim=0)
+        return out_s
+
+    @torch._dynamo.disable()
+    def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
+                                       temperature, minimize_det, penalty_alpha):
+        """
+        Single-head, single-example version of the discrete DPP-based approach, 
+        using a greedy selection of subset S. The final representation is the 
+        mean of the chosen subset's value vectors.
+
+        Using torch._dynamo.disable() to avoid graph break from dynamic subset selection.
+        """
+        T, head_size = q.shape
+        out_all = torch.zeros_like(q)
+
+        for i in range(T):
+            if causal:
+                valid_j = torch.arange(0, i+1, device=q.device)
+            else:
+                valid_j = torch.arange(0, T, device=q.device)
+
+            # Top-M neighbors by dot product
+            q_i = q[i]
+            sim = (q_i.unsqueeze(0) * k[valid_j]).sum(dim=1)
+            n_candidate = min(top_m, len(valid_j))
+            _, topidx_local = torch.topk(sim, k=n_candidate)
+            topidx = valid_j[topidx_local]
+
+            # Greedy selection + aggregator
+            chosen_out = _greedy_select_and_aggregate(
+                i, k, v, topidx, min_size, max_size, minimize_det, penalty_alpha
+            )
+            out_all[i] = chosen_out
+
+        return out_all
+else:
+    # Same logic, but no @torch._dynamo.disable() if dynamo not available
+    def _greedy_select_and_aggregate(i, k, v, top_candidates, min_size, max_size,
+                                     minimize_det, penalty_alpha):
+        top_candidates_list = top_candidates.tolist()
+        if i not in top_candidates_list:
+            top_candidates_list.append(i)
+        top_candidates_set = set(top_candidates_list)
+
+        S = [i]
+        current_score = dpp_objective_score(k[S], minimize_det, penalty_alpha)
+        if i in top_candidates_set:
+            top_candidates_set.remove(i)
+
+        while len(S) < max_size:
+            best_candidate = None
+            best_candidate_score = None
+
+            for c in list(top_candidates_set):
+                newS = S + [c]
+                new_score = dpp_objective_score(k[newS], minimize_det, penalty_alpha)
+
+                if best_candidate_score is None:
                     best_candidate = c
                     best_candidate_score = new_score
-                elif minimize_det and new_score < best_candidate_score:
-                    best_candidate = c
-                    best_candidate_score = new_score
+                else:
+                    if not minimize_det and new_score > best_candidate_score:
+                        best_candidate = c
+                        best_candidate_score = new_score
+                    elif minimize_det and new_score < best_candidate_score:
+                        best_candidate = c
+                        best_candidate_score = new_score
 
-        if best_candidate is None:
-            break
+            if best_candidate is None:
+                break
 
-        if minimize_det:
-            improvement_found = (best_candidate_score < current_score)
-        else:
-            improvement_found = (best_candidate_score > current_score)
+            if minimize_det:
+                improvement_found = (best_candidate_score < current_score)
+            else:
+                improvement_found = (best_candidate_score > current_score)
 
-        # Accept new candidate if it improves the objective or if we haven't reached min_size
-        if improvement_found or (len(S) < min_size):
-            S.append(best_candidate)
-            top_candidates_list.remove(best_candidate)
-            current_score = best_candidate_score
-        else:
-            break
+            if improvement_found or (len(S) < min_size):
+                S.append(best_candidate)
+                top_candidates_set.remove(best_candidate)
+                current_score = best_candidate_score
+            else:
+                break
 
-    # Instead of doing standard attention, just aggregate the chosen subset.
-    # Here we use a simple mean of the chosen vectors as the new representation.
-    # (You can choose a different aggregator if you prefer.)
-    out_s = v[S].mean(dim=0)
-    return out_s
+        return v[S].mean(dim=0)
 
-def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
-                                   temperature, minimize_det, penalty_alpha):
-    """
-    A single-head, single-example version of the discrete DPP-based approach, using
-    a greedy selection of subset S. We then replace the token representation with
-    the mean of the chosen subset's values (no softmax).
+    def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
+                                       temperature, minimize_det, penalty_alpha):
+        T, head_size = q.shape
+        out_all = torch.zeros_like(q)
 
-    q, k, v: shape [T, head_size]
-    causal: if True, token i can only attend to j <= i
-    min_size, max_size: subset sizes must be in [min_size..max_size] (including i)
-    top_m: only consider top-M neighbors by dot product
-    temperature: placeholder, not used here
-    minimize_det: True -> negative log(det); False -> log(det)
-    penalty_alpha: exponent for subset size penalty
-    Returns: [T, head_size]
-    """
-    T, head_size = q.shape
-    out_all = torch.zeros_like(q)
+        for i in range(T):
+            if causal:
+                valid_j = torch.arange(0, i+1, device=q.device)
+            else:
+                valid_j = torch.arange(0, T, device=q.device)
 
-    for i in range(T):
-        # 1) Determine valid j indices (causal or full)
-        if causal:
-            valid_j = torch.arange(0, i+1, device=q.device)
-        else:
-            valid_j = torch.arange(0, T, device=q.device)
+            q_i = q[i]
+            sim = (q_i.unsqueeze(0) * k[valid_j]).sum(dim=1)
+            n_candidate = min(top_m, len(valid_j))
+            _, topidx_local = torch.topk(sim, k=n_candidate)
+            topidx = valid_j[topidx_local]
 
-        # 2) Top-M neighbors by dot product
-        q_i = q[i]
-        sim = (q_i.unsqueeze(0) * k[valid_j]).sum(dim=1)
-        n_candidate = min(top_m, len(valid_j))
-        _, topidx_local = torch.topk(sim, k=n_candidate)
-        topidx = valid_j[topidx_local]
+            chosen_out = _greedy_select_and_aggregate(
+                i, k, v, topidx, min_size, max_size, minimize_det, penalty_alpha
+            )
+            out_all[i] = chosen_out
 
-        # Ensure i is in the candidate set
-        if i not in topidx:
-            topidx = torch.cat([topidx, i.unsqueeze(0)])
+        return out_all
 
-        # 3) Greedy selection + aggregator
-        chosen_out = _greedy_select_and_aggregate(
-            i, k, v, topidx, min_size, max_size, minimize_det, penalty_alpha
-        )
-        out_all[i] = chosen_out
-
-    return out_all
 
 #
 # The rest: GPT code, with the CausalSelfAttention always using the DPP approach
@@ -163,11 +249,10 @@ class GPTConfig:
     bias: bool = True
 
     # DPP options
-    # Even if 'use_dpp_attention' is here, we will treat it as always True below.
     use_dpp_attention: bool = True
     dpp_min_size: int = 2
-    dpp_max_size: int = 64
-    dpp_top_m: int = 64
+    dpp_max_size: int = 8
+    dpp_top_m: int = 8
     dpp_temperature: float = 0.1
     dpp_minimize_det: bool = True
     dpp_penalty_alpha: float = 1.0
@@ -297,7 +382,9 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is {self.config.block_size}"
+        assert t <= self.config.block_size, (
+            f"Cannot forward sequence of length {t}, block size is {self.config.block_size}"
+        )
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         tok_emb = self.transformer.wte(idx)
@@ -310,8 +397,8 @@ class GPT(nn.Module):
         if targets is not None:
             logits = self.lm_head(x)
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), 
-                targets.view(-1), 
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
                 ignore_index=-1
             )
         else:
@@ -389,16 +476,17 @@ class GPT(nn.Module):
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=betas, **extra_args
-        )
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
         return optimizer
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            idx_cond = (
+                idx if idx.size(1) <= self.config.block_size 
+                else idx[:, -self.config.block_size:]
+            )
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
