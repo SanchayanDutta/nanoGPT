@@ -33,23 +33,23 @@ def attention_for_subset(q_i, k_subset, v_subset):
 def dpp_objective_score(E, minimize_det, penalty_alpha):
     """
     Computes the DPP log-determinant based objective (or negative of it),
-    with a size penalty: score = (+/-) log(det(E E^T)) / (|S|^penalty_alpha).
+    with a size penalty: score = (+/-) log(det(E E^T)) / (|S|^).
     """
     det_val = dpp_det_score(E)
     log_det = torch.log(det_val + 1e-6)
     subset_size = E.size(0)
     if minimize_det:
         # If we want to 'minimize' raw det, the objective is negative log(det).
-        # Divided by subset_size^penalty_alpha
-        score = log_det / (subset_size ** penalty_alpha)
+        # Divided by subset_size^
+        score = log_det / (subset_size ** )
     else:
         # If we want to 'maximize' raw det, the objective is log(det).
-        # Divided by subset_size^penalty_alpha
-        score = -log_det / (subset_size ** penalty_alpha)
+        # Divided by subset_size^
+        score = -log_det / (subset_size ** )
     return score
 
 def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
-                                   temperature, minimize_det, penalty_alpha):
+                                   temperature, minimize_det, ):
     """
     A single-head, single-example version of the discrete DPP-based attention that uses
     a greedy selection approach instead of brute-force enumeration.
@@ -60,7 +60,7 @@ def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
     top_m: only consider top-M neighbors by dot product
     temperature: (not used in greedy, but we keep it for signature compatibility)
     : if True, we do negative log-det (favoring alignment)
-    penalty_alpha: exponent for subset size penalty
+    : exponent for subset size penalty
     Returns: output of shape [T, head_size]
     """
     T, head_size = q.shape
@@ -89,7 +89,7 @@ def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
         # We'll define a local function to do that selection for the i-th token
         # Note: we only pick from topidx; that is the candidate pool.
         chosen_out = _greedy_select_and_attention(
-            i, q_i, k, v, topidx, min_size, max_size, , penalty_alpha
+            i, q_i, k, v, topidx, min_size, max_size, penalty_alpha
         )
         out_all[i] = chosen_out
 
