@@ -190,7 +190,7 @@ class GPTConfig:
     dpp_top_m: int = 8
     dpp_temperature: float = 0.1
     dpp_minimize_det: bool = True
-    dpp_penalty_alpha: float = 1.0
+    dpp_penalty_alpha: float = 0.0
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
