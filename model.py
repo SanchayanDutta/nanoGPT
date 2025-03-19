@@ -18,21 +18,9 @@ def dpp_det_score(vecs):
     gram = vecs_32 @ vecs_32.T
     return torch.linalg.det(gram)
 
-def attention_for_subset(q_i, k_subset, v_subset):
-    """
-    Standard dot-product attention from a single query q_i over only the keys in k_subset.
-    Returns a weighted sum of v_subset.
-    """
-    head_size = q_i.shape[0]
-    # Dot with the query
-    dot = (q_i.unsqueeze(0) * k_subset).sum(dim=1) / (head_size**0.5)  # shape [subset_size]
-    w = F.softmax(dot, dim=0)  # shape [subset_size]
-    out = (w.unsqueeze(1) * v_subset).sum(dim=0)  # shape [head_size]
-    return out
-
 def dpp_objective_score(E, minimize_det, penalty_alpha):
     """
-    Computes the DPP log-determinant based objective (or negative of it),
+    Computes the DPP log-determinant-based objective (or negative of it),
     with a size penalty: score = (+/-) log(det(E E^T)) / (|S|^penalty_alpha).
     """
     det_val = dpp_det_score(E)
@@ -48,26 +36,84 @@ def dpp_objective_score(E, minimize_det, penalty_alpha):
         score = -log_det / (subset_size ** penalty_alpha)
     return score
 
+def _greedy_select_and_aggregate(i, k, v, top_candidates, min_size, max_size,
+                                 minimize_det, penalty_alpha):
+    """
+    Internal helper: picks a subset that always includes 'i' using a greedy approach
+    and returns the aggregate of those vectors (no softmax-based attention).
+    """
+    S = [i]  # Always include current token i
+    current_score = dpp_objective_score(k[S], minimize_det, penalty_alpha)
+
+    # Convert to a mutable set
+    top_candidates_list = set(top_candidates.tolist())
+    if i in top_candidates_list:
+        top_candidates_list.remove(i)
+
+    while len(S) < max_size:
+        best_candidate = None
+        best_candidate_score = None
+
+        for c in top_candidates_list:
+            newS = S + [c]
+            new_score = dpp_objective_score(k[newS], minimize_det, penalty_alpha)
+
+            # For minimize_det == True, a smaller numeric value is better (negative log-det).
+            # For minimize_det == False, a larger numeric value is better (log-det).
+            if best_candidate_score is None:
+                best_candidate = c
+                best_candidate_score = new_score
+            else:
+                if not minimize_det and new_score > best_candidate_score:
+                    best_candidate = c
+                    best_candidate_score = new_score
+                elif minimize_det and new_score < best_candidate_score:
+                    best_candidate = c
+                    best_candidate_score = new_score
+
+        if best_candidate is None:
+            break
+
+        if minimize_det:
+            improvement_found = (best_candidate_score < current_score)
+        else:
+            improvement_found = (best_candidate_score > current_score)
+
+        # Accept new candidate if it improves the objective or if we haven't reached min_size
+        if improvement_found or (len(S) < min_size):
+            S.append(best_candidate)
+            top_candidates_list.remove(best_candidate)
+            current_score = best_candidate_score
+        else:
+            break
+
+    # Instead of doing standard attention, just aggregate the chosen subset.
+    # Here we use a simple mean of the chosen vectors as the new representation.
+    # (You can choose a different aggregator if you prefer.)
+    out_s = v[S].mean(dim=0)
+    return out_s
+
 def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
                                    temperature, minimize_det, penalty_alpha):
     """
-    A single-head, single-example version of the discrete DPP-based attention that uses
-    a greedy selection approach instead of brute-force enumeration.
+    A single-head, single-example version of the discrete DPP-based approach, using
+    a greedy selection of subset S. We then replace the token representation with
+    the mean of the chosen subset's values (no softmax).
 
     q, k, v: shape [T, head_size]
     causal: if True, token i can only attend to j <= i
     min_size, max_size: subset sizes must be in [min_size..max_size] (including i)
     top_m: only consider top-M neighbors by dot product
-    temperature: (not used in greedy, but we keep it for signature compatibility)
-    minimize_det: if True, we do negative log-det (favoring alignment)
+    temperature: placeholder, not used here
+    minimize_det: True -> negative log(det); False -> log(det)
     penalty_alpha: exponent for subset size penalty
-    Returns: output of shape [T, head_size]
+    Returns: [T, head_size]
     """
     T, head_size = q.shape
     out_all = torch.zeros_like(q)
 
     for i in range(T):
-        # 1) Determine valid j indices (causal)
+        # 1) Determine valid j indices (causal or full)
         if causal:
             valid_j = torch.arange(0, i+1, device=q.device)
         else:
@@ -80,91 +126,24 @@ def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
         _, topidx_local = torch.topk(sim, k=n_candidate)
         topidx = valid_j[topidx_local]
 
-        # If topidx doesn't even contain i, ensure i is included
-        # (the code below always includes i, but we also don't want to remove i from the "candidates")
+        # Ensure i is in the candidate set
         if i not in topidx:
             topidx = torch.cat([topidx, i.unsqueeze(0)])
 
-        # 3) Greedy selection of subset S that always includes i
-        # We'll define a local function to do that selection for the i-th token
-        # Note: we only pick from topidx; that is the candidate pool.
-        chosen_out = _greedy_select_and_attention(
-            i, q_i, k, v, topidx, min_size, max_size, minimize_det, penalty_alpha
+        # 3) Greedy selection + aggregator
+        chosen_out = _greedy_select_and_aggregate(
+            i, k, v, topidx, min_size, max_size, minimize_det, penalty_alpha
         )
         out_all[i] = chosen_out
 
     return out_all
 
-def _greedy_select_and_attention(i, q_i, k, v, top_candidates, min_size, max_size,
-                                 minimize_det, penalty_alpha):
-    """
-    Internal helper: picks a subset that always includes 'i' using a greedy approach
-    and returns the standard attention result over that subset.
-    """
-    S = [i]  # Always include current token i
-    current_score = dpp_objective_score(k[S], minimize_det, penalty_alpha)
-
-    # Convert top_candidates to list for iteration
-    top_candidates_list = set(top_candidates.tolist())
-    # Make sure i is not re-picked
-    if i in top_candidates_list:
-        top_candidates_list.remove(i)
-
-    while len(S) < max_size:
-        best_candidate = None
-        best_candidate_score = None  # We'll track the objective after adding candidate
-
-        # Test adding each candidate c not already in S
-        for c in top_candidates_list:
-            newS = S + [c]
-            new_score = dpp_objective_score(k[newS], minimize_det, penalty_alpha)
-
-            # For minimize_det == True, 'score' is negative if determinant is large,
-            # so the "better" subset has a smaller numeric value of new_score.
-            # For minimize_det == False, bigger numeric value is better.
-            if best_candidate_score is None:
-                best_candidate = c
-                best_candidate_score = new_score
-            else:
-                if not minimize_det and new_score > best_candidate_score:
-                    best_candidate = c
-                    best_candidate_score = new_score
-                elif minimize_det and new_score < best_candidate_score:
-                    best_candidate = c
-                    best_candidate_score = new_score
-
-        # If we found no candidate, just break
-        if best_candidate is None:
-            break
-
-        # See if the best candidate actually improves the score
-        # If not, we stop (unless we haven't reached min_size yet).
-        if minimize_det:
-            improvement_found = (best_candidate_score < current_score)
-        else:
-            improvement_found = (best_candidate_score > current_score)
-
-        if improvement_found or (len(S) < min_size):
-            # Accept the new candidate
-            S.append(best_candidate)
-            top_candidates_list.remove(best_candidate)
-            current_score = best_candidate_score
-        else:
-            # No improvement, and we have at least min_size
-            break
-
-    # Now we have subset S. Do standard attention over S.
-    out_s = attention_for_subset(q_i, k[S], v[S])
-
-    # Straight-through version: we'll treat out_s as final.
-    return out_s
-
 #
-# The rest: original GPT code, with no changes aside from calling our new DPP function
+# The rest: GPT code, with the CausalSelfAttention always using the DPP approach
 #
 
 class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't allow bias=False directly. """
+    """LayerNorm but with an optional bias. PyTorch doesn't allow bias=False directly."""
     def __init__(self, ndim, bias):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
@@ -183,14 +162,15 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True
 
-    # New DPP options
-    use_dpp_attention: bool = False
+    # DPP options
+    # Even if 'use_dpp_attention' is here, we will treat it as always True below.
+    use_dpp_attention: bool = True
     dpp_min_size: int = 2
-    dpp_max_size: int = 64
-    dpp_top_m: int = 64
+    dpp_max_size: int = 8
+    dpp_top_m: int = 8
     dpp_temperature: float = 0.1
-    dpp_minimize_det: bool = False
-    dpp_penalty_alpha: float = 0.0
+    dpp_minimize_det: bool = True
+    dpp_penalty_alpha: float = 1.0
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -204,14 +184,6 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.flash = hasattr(F, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            self.register_buffer(
-                "bias",
-                torch.tril(torch.ones(config.block_size, config.block_size))
-                .view(1, 1, config.block_size, config.block_size)
-            )
 
     def forward(self, x):
         B, T, C = x.size()
@@ -225,45 +197,28 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, head_size).transpose(1, 2)
         v = v.view(B, T, self.n_head, head_size).transpose(1, 2)
 
-        # If not using DPP-based approach, do standard attention
-        if not self.config.use_dpp_attention:
-            if self.flash:
-                # flash
-                y = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=None,
-                    dropout_p=self.dropout if self.training else 0,
-                    is_causal=True
+        # Always use the DPP-based approach, with no softmax
+        y = torch.zeros_like(q)
+        for b_idx in range(B):
+            for h_idx in range(self.n_head):
+                qbh = q[b_idx, h_idx]
+                kbh = k[b_idx, h_idx]
+                vbh = v[b_idx, h_idx]
+                out_bh = dpp_straight_through_attention(
+                    qbh,
+                    kbh,
+                    vbh,
+                    causal=True,  # keep causal behavior
+                    min_size=self.config.dpp_min_size,
+                    max_size=self.config.dpp_max_size,
+                    top_m=self.config.dpp_top_m,
+                    temperature=self.config.dpp_temperature,
+                    minimize_det=self.config.dpp_minimize_det,
+                    penalty_alpha=self.config.dpp_penalty_alpha
                 )
-            else:
-                # manual
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-                att = F.softmax(att, dim=-1)
-                att = self.attn_dropout(att)
-                y = att @ v
-        else:
-            # Use our new DPP-based approach with greedy selection
-            y = torch.zeros_like(q)
-            for b_idx in range(B):
-                for h_idx in range(self.n_head):
-                    qbh = q[b_idx, h_idx]  # [T, head_size]
-                    kbh = k[b_idx, h_idx]
-                    vbh = v[b_idx, h_idx]
-                    # Run the discrete approach
-                    out_bh = dpp_straight_through_attention(
-                        qbh, kbh, vbh,
-                        causal=True,  # or False if you want non-causal
-                        min_size=self.config.dpp_min_size,
-                        max_size=self.config.dpp_max_size,
-                        top_m=self.config.dpp_top_m,
-                        temperature=self.config.dpp_temperature,
-                        minimize_det=self.config.dpp_minimize_det,
-                        penalty_alpha=self.config.dpp_penalty_alpha
-                    )
-                    y[b_idx, h_idx] = out_bh
+                y[b_idx, h_idx] = out_bh
 
-        # [B, n_head, T, head_size]
+        # [B, n_head, T, head_size] -> [B, T, C]
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
@@ -327,6 +282,7 @@ class GPT(nn.Module):
     def get_num_params(self, non_embedding=True):
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
+            # Optionally remove positional embeddings from the count
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -353,7 +309,11 @@ class GPT(nn.Module):
 
         if targets is not None:
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), 
+                targets.view(-1), 
+                ignore_index=-1
+            )
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
@@ -364,9 +324,6 @@ class GPT(nn.Module):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -389,18 +346,22 @@ class GPT(nn.Module):
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
-        # Create from-scratch GPT
         config = GPTConfig(**config_args)
         model = GPT(config)
         sd = model.state_dict()
-        sd_keys = [k for k in sd.keys() if not k.endswith('.attn.bias')]
+        sd_keys = [k for k in sd.keys()]
 
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
-        sd_keys_hf = [k for k in sd_hf.keys() if not k.endswith('.attn.masked_bias')]
+        sd_keys_hf = [k for k in sd_hf.keys()]
+
+        # Exclude any bias terms that do not exist here or naming differences
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 assert sd_hf[k].shape[::-1] == sd[k].shape
@@ -428,7 +389,9 @@ class GPT(nn.Module):
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=betas, **extra_args
+        )
         print(f"using fused AdamW: {use_fused}")
         return optimizer
 
