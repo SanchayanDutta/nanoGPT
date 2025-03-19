@@ -59,7 +59,7 @@ def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
     min_size, max_size: subset sizes must be in [min_size..max_size] (including i)
     top_m: only consider top-M neighbors by dot product
     temperature: (not used in greedy, but we keep it for signature compatibility)
-    minimize_det: if True, we do negative log-det (favoring alignment)
+    : if True, we do negative log-det (favoring alignment)
     penalty_alpha: exponent for subset size penalty
     Returns: output of shape [T, head_size]
     """
@@ -89,20 +89,20 @@ def dpp_straight_through_attention(q, k, v, causal, min_size, max_size, top_m,
         # We'll define a local function to do that selection for the i-th token
         # Note: we only pick from topidx; that is the candidate pool.
         chosen_out = _greedy_select_and_attention(
-            i, q_i, k, v, topidx, min_size, max_size, minimize_det, penalty_alpha
+            i, q_i, k, v, topidx, min_size, max_size, , penalty_alpha
         )
         out_all[i] = chosen_out
 
     return out_all
 
 def _greedy_select_and_attention(i, q_i, k, v, top_candidates, min_size, max_size,
-                                 minimize_det, penalty_alpha):
+                                 , penalty_alpha):
     """
     Internal helper: picks a subset that always includes 'i' using a greedy approach
     and returns the standard attention result over that subset.
     """
     S = [i]  # Always include current token i
-    current_score = dpp_objective_score(k[S], minimize_det, penalty_alpha)
+    current_score = dpp_objective_score(k[S], , penalty_alpha)
 
     # Convert top_candidates to list for iteration
     top_candidates_list = set(top_candidates.tolist())
@@ -117,7 +117,7 @@ def _greedy_select_and_attention(i, q_i, k, v, top_candidates, min_size, max_siz
         # Test adding each candidate c not already in S
         for c in top_candidates_list:
             newS = S + [c]
-            new_score = dpp_objective_score(k[newS], minimize_det, penalty_alpha)
+            new_score = dpp_objective_score(k[newS], , penalty_alpha)
 
             # For minimize_det == True, 'score' is negative if determinant is large,
             # so the "better" subset has a smaller numeric value of new_score.
@@ -186,10 +186,10 @@ class GPTConfig:
     # New DPP options
     use_dpp_attention: bool = False
     dpp_min_size: int = 2
-    dpp_max_size: int = 8
-    dpp_top_m: int = 16
+    dpp_max_size: int = 64
+    dpp_top_m: int = 64
     dpp_temperature: float = 0.1
-    dpp_minimize_det: bool = False
+    dpp_minimize_det: bool = True
     dpp_penalty_alpha: float = 0.0
 
 class CausalSelfAttention(nn.Module):
